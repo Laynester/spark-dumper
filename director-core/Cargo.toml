@@ -1,0 +1,10 @@
+[package]
+name = "director-core"
+version = "0.1.0"
+edition = "2021"
+description = "Director/Shockwave file format data types"
+
+[dependencies]
+director-rifx = { path = "../director-rifx" }
+flate2 = "1"
+log = "0.4"

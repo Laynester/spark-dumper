@@ -1,0 +1,21 @@
+[package]
+name = "director-dump"
+version = "0.1.0"
+edition = "2021"
+description = "CLI tool for dumping Director/Shockwave file structure"
+
+[[bin]]
+name = "sparkd"
+path = "src/main.rs"
+
+[[bin]]
+name = "director-debug"
+path = "src/debug.rs"
+
+[dependencies]
+director-rifx = { path = "../director-rifx" }
+director-core = { path = "../director-core" }
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -1,0 +1,116 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile deps (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --locked -p director-dump --bin sparkd --target ${{ matrix.target }}
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/$TARGET/release/sparkd"
+          chmod +x "$BIN"
+          # target triple -> short os/arch for asset naming
+          OS=$(echo "$TARGET" | sed -n 's/^[a-z0-9]*-unknown-\(linux\|darwin\)-.*/\1/p')
+          if [ "$OS" = "" ]; then OS="unknown"; fi
+          ARCH=$(case "$TARGET" in *arm64*|aarch64*) echo arm64;; x86_64*) echo x86_64;; esac)
+          PKG="sparkd-${{ steps.version.outputs.VERSION }}-$OS-$ARCH"
+          mkdir -p "$PKG"
+          cp "$BIN" "$PKG/sparkd"
+          tar -czf "$PKG.tar.gz" "$PKG"
+          echo "ASSET=$PKG.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          BIN="target/$TARGET/release/sparkd.exe"
+          chmod +x "$BIN"
+          PKG="sparkd-${{ steps.version.outputs.VERSION }}-windows-x86_64"
+          mkdir -p "$PKG"
+          cp "$BIN" "$PKG/sparkd.exe"
+          cd "$PKG"
+          powershell -Command "Compress-Archive -Force -Path 'sparkd.exe' -DestinationPath '../$PKG.zip'"
+          cd ..
+          echo "ASSET=$PKG.zip" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+
+  release:
+    name: attach installers + README
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Attach installers + README to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install.sh
+            install.ps1
+            README.md

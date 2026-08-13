@@ -1,0 +1,9 @@
+[package]
+name = "director-rifx"
+version = "0.1.0"
+edition = "2021"
+description = "RIFX container format I/O for Director/Shockwave files"
+
+[dependencies]
+flate2 = "1"
+log = "0.4"

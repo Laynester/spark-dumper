@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = [
+    "director-rifx",
+    "director-core",
+    "director-dump",
+]
