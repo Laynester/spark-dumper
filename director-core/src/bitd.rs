@@ -241,26 +241,56 @@ fn decode_16bit(data: &[u8], width: usize, height: usize, pitch: usize) -> Resul
 
 /// Decode 32-bit pixels (byte order A,R,G,B) to RGBA, following
 /// LibreShockwave decode32Bit (interleaved, pre-D10).
-fn decode_32bit(data: &[u8], width: usize, height: usize, pitch: usize) -> Result<Vec<u8>, ParseError> {
+fn decode_32bit(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    pitch: usize,
+    director_version: u16,
+) -> Result<Vec<u8>, ParseError> {
     let scan_width = if pitch > 0 { pitch / 4 } else { width };
     let expected = scan_width * height * 4;
     let raw = decompress_bytes(data, expected)?;
 
+    // LibreShockwave decode32Bit: Director >= 1000 (D5+) stores 32-bit pixels
+    // as SEPARATED channel planes (four scan_width*height planes in A,R,G,B
+    // order); older files interleave ARGB per pixel. Habbo's D7 CCTs are
+    // separated — decoding them interleaved scrambles the channels (the
+    // catalog's club_neg/club_pos icons and room pen masks render as
+    // semi-transparent black smudges).
+    let channels_separated = director_version >= 1000;
     let mut rgba = Vec::with_capacity(width * height * 4);
-    for y in 0..height {
-        for x in 0..width {
-            let byte_idx = (y * scan_width + x) * 4;
-            if byte_idx + 3 >= raw.len() {
-                rgba.extend_from_slice(&[0, 0, 0, 255]);
-                continue;
+    if channels_separated {
+        for y in 0..height {
+            let line = y * scan_width * 4;
+            for x in 0..width {
+                let a = line + x;
+                let r = line + x + scan_width;
+                let g = line + x + scan_width * 2;
+                let b = line + x + scan_width * 3;
+                if b >= raw.len() {
+                    rgba.extend_from_slice(&[0, 0, 0, 255]);
+                    continue;
+                }
+                rgba.extend_from_slice(&[raw[r], raw[g], raw[b], raw[a]]);
             }
-            // Stored byte order: A, R, G, B
-            rgba.extend_from_slice(&[
-                raw[byte_idx + 1],
-                raw[byte_idx + 2],
-                raw[byte_idx + 3],
-                raw[byte_idx],
-            ]);
+        }
+    } else {
+        for y in 0..height {
+            for x in 0..width {
+                let byte_idx = (y * scan_width + x) * 4;
+                if byte_idx + 3 >= raw.len() {
+                    rgba.extend_from_slice(&[0, 0, 0, 255]);
+                    continue;
+                }
+                // Stored byte order: A, R, G, B
+                rgba.extend_from_slice(&[
+                    raw[byte_idx + 1],
+                    raw[byte_idx + 2],
+                    raw[byte_idx + 3],
+                    raw[byte_idx],
+                ]);
+            }
         }
     }
     Ok(rgba)
@@ -284,6 +314,7 @@ pub fn decode_to_rgba(
     bpp: u8,
     pitch: usize,
     palette: &[(u8, u8, u8)],
+    director_version: u16,
 ) -> Result<Vec<u8>, ParseError> {
     match bpp {
         1 => {
@@ -300,10 +331,28 @@ pub fn decode_to_rgba(
         }
         2 | 4 | 8 => {
             let indices = decompress_rle(data, width, height, bpp, pitch)?;
+            // LibreShockwave BitmapDecoder scales low-depth indices to their
+            // System-palette positions before the palette lookup: 2-bit values
+            // 0..3 -> 0/85/170/255 and 4-bit 0..15 -> 0/17/.../255 (round(
+            // value/max*255)). Classic Director authored these against the Mac
+            // system palette, whose 2-bit gray levels live at 0/85/170/255 and
+            // 4-bit at multiples of 17 — so raw index 3 of a SystemMac member
+            // resolves to palette[255] (black), NOT palette[3] (yellow).
+            // Without this, e.g. hh_interface's info_stand_txt_bg and the pet
+            // shadow masks render yellow instead of black. 8-bit stays raw.
+            let indices: Vec<u8> = if bpp == 2 || bpp == 4 {
+                let max = if bpp == 2 { 3u32 } else { 15u32 };
+                indices
+                    .iter()
+                    .map(|&v| ((v as u32 * 255 + max / 2) / max) as u8)
+                    .collect()
+            } else {
+                indices
+            };
             Ok(apply_palette(&indices, palette, width, height))
         }
         16 => decode_16bit(data, width, height, pitch),
-        32 => decode_32bit(data, width, height, pitch),
+        32 => decode_32bit(data, width, height, pitch, director_version),
         _ => Err(ParseError::InvalidData(format!("unsupported bpp: {bpp}"))),
     }
 }
@@ -322,7 +371,7 @@ pub fn decode_bitmap(chunk: &Chunk, info: &BitmapInfo, palette: &[(u8, u8, u8)])
         if min_pitch % 2 == 1 { min_pitch + 1 } else { min_pitch }
     };
 
-    let rgba = decode_to_rgba(data, width, height, bpp, pitch, palette)?;
+    let rgba = decode_to_rgba(data, width, height, bpp, pitch, palette, 0)?;
 
     Ok(DecodedBitmap {
         width,
@@ -477,7 +526,7 @@ mod tests {
         // SystemWinD5 palette (entry 0 white, entry 1 cyan) would map idx 1
         // to cyan if the palette were wrongly applied.
         let palette = [(255, 255, 255), (0, 255, 255)];
-        let rgba = decode_to_rgba(&data, 8, 1, 1, 1, &palette).expect("decode");
+        let rgba = decode_to_rgba(&data, 8, 1, 1, 1, &palette, 0).expect("decode");
         let mut px = rgba.chunks_exact(4);
         let expected = [
             [0, 0, 0, 255],      // bit=1 -> black
@@ -493,6 +542,39 @@ mod tests {
             assert_eq!(px.next().unwrap(), e);
         }
         assert!(px.next().is_none());
+    }
+
+    /// Regression: 2-bit members index the palette at System-palette
+    /// positions (0/85/170/255), not raw 0..3. hh_interface member 353
+    /// (info_stand_txt_bg) is 2-bit SystemMac: raw index 3 must decode to
+    /// SystemMac[255] = black, never SystemMac[3] = yellow.
+    #[test]
+    fn decode_2bit_scales_indices_to_system_positions() {
+        // 4 pixels, 1 row of 2-bit values 0,1,2,3 packed into one byte:
+        // 00 01 10 11 = 0b00011011 = 0x1B
+        let data = [0x1Bu8];
+        let system_mac = crate::clut::system_mac_palette();
+        let palette = system_mac.colors;
+        let rgba = decode_to_rgba(&data, 4, 1, 2, 1, &palette, 0).expect("decode");
+        let mut px = rgba.chunks_exact(4);
+        // raw 0 -> palette[0]   (white)
+        // raw 1 -> palette[85]  (mid gray)
+        // raw 2 -> palette[170] (dark gray)
+        // raw 3 -> palette[255] (black)
+        let p0 = palette[0];
+        let p85 = palette[85];
+        let p170 = palette[170];
+        let p255 = palette[255];
+        let p3 = palette[3];
+        assert_eq!(px.next().unwrap(), &[p0.0, p0.1, p0.2, 255]);
+        assert_eq!(px.next().unwrap(), &[p85.0, p85.1, p85.2, 255]);
+        assert_eq!(px.next().unwrap(), &[p170.0, p170.1, p170.2, 255]);
+        assert_eq!(px.next().unwrap(), &[p255.0, p255.1, p255.2, 255]);
+        assert!(px.next().is_none());
+        // The whole point: SystemMac[255] is black, SystemMac[3] is yellow.
+        assert_eq!(p255, (0, 0, 0));
+        assert_eq!(p3, palette[3]);
+        assert_ne!(p3, (0, 0, 0));
     }
 
     #[test]

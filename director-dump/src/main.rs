@@ -48,6 +48,11 @@ struct Cli {
     /// Worker threads for directory export (default 1)
     #[arg(short = 'j', long)]
     threads: Option<usize>,
+
+    /// Also write a .lasm disassembly next to each exported .ls script
+    /// (raw LSCR bytecode, opcode-level — for verifying decompiler output)
+    #[arg(long)]
+    lasm: bool,
 }
 
 fn main() {
@@ -76,7 +81,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Single file: export directly into the output directory. Debug flags
-    // (-x, -m, -t, -o, -c, --palettes) still inspect/dump as before.
+    // (-x, -m, -t, -o, -c, --palettes, --lasm) still inspect/dump as before.
     run_inspect(cli, input, out)
 }
 
@@ -346,7 +351,7 @@ fn run_inspect(cli: &Cli, path: &Path, out: &Path) -> Result<(), Box<dyn std::er
             .and_then(|s| s.to_str())
             .unwrap_or("export");
         println!("Exporting project to {}...", out.display());
-        export::export_project(&root, out, name)?;
+        export::export_project(&root, out, name, cli.lasm)?;
         println!("Export complete.");
 
     Ok(())
@@ -380,7 +385,7 @@ fn run_directory(cli: &Cli, dir: &Path, export_root: &Path) -> Result<(), Box<dy
                 if i >= files.len() {
                     break;
                 }
-                match export_one(&files[i], dir, export_root) {
+                match export_one(&files[i], dir, export_root, cli.lasm) {
                     ExportOutcome::Ok => {
                         ok.fetch_add(1, Relaxed);
                         println!("OK   {}", files[i].display());
@@ -417,7 +422,7 @@ enum ExportOutcome {
 /// Export a single Director file under `export_root`, mirroring its path
 /// relative to `dir`. Read, HTML-stub check, parse and export all happen here
 /// so the caller can run this on a worker thread.
-fn export_one(file: &Path, dir: &Path, export_root: &Path) -> ExportOutcome {
+fn export_one(file: &Path, dir: &Path, export_root: &Path, lasm: bool) -> ExportOutcome {
     let data = match std::fs::read(file) {
         Ok(d) => d,
         Err(e) => return ExportOutcome::Failed(e.to_string()),
@@ -441,7 +446,7 @@ fn export_one(file: &Path, dir: &Path, export_root: &Path) -> ExportOutcome {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("export");
-    if let Err(e) = export::export_project(&root, &out_dir, name) {
+    if let Err(e) = export::export_project(&root, &out_dir, name, lasm) {
         return ExportOutcome::Failed(e.to_string());
     }
     ExportOutcome::Ok

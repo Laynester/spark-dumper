@@ -256,6 +256,102 @@ pub fn read_member_name(info: &[u8]) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Shape member kind (Director ShapeType codes; port of LibreShockwave
+/// shapeTypeFromCode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeType {
+    Rect,
+    OvalRect,
+    Oval,
+    Line,
+    Unknown,
+}
+
+/// Parsed Director shape member (the CASt member's data block, LibreShockwave
+/// ShapeInfo). The exporter renders this as `shapes/NNNN_shape_<name>.txt`
+/// (key: value lines), which the runtime parses back to draw the entry/room
+/// scenes' solid-fill rects/ovals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeInfo {
+    pub shape_type: ShapeType,
+    pub reg_x: u16,
+    pub reg_y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub color: u8,
+    pub back_color: u8,
+    pub fill_type: u8,
+    pub line_thickness: u8,
+    pub line_direction: u8,
+}
+
+impl ShapeInfo {
+    pub fn is_filled(&self) -> bool {
+        self.fill_type != 0
+    }
+
+    pub fn is_outline_invisible(&self) -> bool {
+        !self.is_filled() && self.line_thickness <= 1
+    }
+
+    /// Parse from the CASt member's DATA block (after the D5 header + info
+    /// section). Layout (big-endian, LibreShockwave ShapeInfo::parse):
+    ///   u16 shapeTypeRaw, u16 regY, u16 regX, u16 height, u16 width,
+    ///   skip 2, u8 color, u8 backColor, u8 fillType, u8 lineThickness,
+    ///   u8 lineDirection.
+    pub fn parse(data: &[u8]) -> Option<ShapeInfo> {
+        if data.len() < 17 {
+            return None;
+        }
+        let shape_type = match u16::from_be_bytes([data[0], data[1]]) {
+            0x01 => ShapeType::Rect,
+            0x02 => ShapeType::OvalRect,
+            0x03 => ShapeType::Oval,
+            0x08 => ShapeType::Line,
+            _ => ShapeType::Unknown,
+        };
+        Some(ShapeInfo {
+            shape_type,
+            reg_y: u16::from_be_bytes([data[2], data[3]]),
+            reg_x: u16::from_be_bytes([data[4], data[5]]),
+            height: u16::from_be_bytes([data[6], data[7]]),
+            width: u16::from_be_bytes([data[8], data[9]]),
+            color: data[12],
+            back_color: data[13],
+            fill_type: data[14],
+            line_thickness: data[15],
+            line_direction: data[16],
+        })
+    }
+
+    /// The runtime's text form (`shapes/*.txt`): the exact key: value lines
+    /// LibreShockwave's CastExporter writes (color/backColor as hex like the
+    /// C++ `std::hex << std::showbase` — 0 prints as `0`, nonzero as `0x..`).
+    pub fn to_text(&self) -> String {
+        let color = if self.color == 0 { "0".to_string() } else { format!("0x{:x}", self.color) };
+        let back = if self.back_color == 0 { "0".to_string() } else { format!("0x{:x}", self.back_color) };
+        let shape_type = match self.shape_type {
+            ShapeType::Rect => "rect",
+            ShapeType::OvalRect => "ovalRect",
+            ShapeType::Oval => "oval",
+            ShapeType::Line => "line",
+            ShapeType::Unknown => "unknown",
+        };
+        format!(
+            "shapeType: {shape_type}\nregX: {}\nregY: {}\nwidth: {}\nheight: {}\ncolor: {color}\nbackColor: {back}\nfillType: {}\nlineThickness: {}\nlineDirection: {}\nfilled: {}\noutlineInvisible: {}\n",
+            self.reg_x,
+            self.reg_y,
+            self.width,
+            self.height,
+            self.fill_type,
+            self.line_thickness,
+            self.line_direction,
+            if self.is_filled() { "yes" } else { "no" },
+            if self.is_outline_invisible() { "yes" } else { "no" },
+        )
+    }
+}
+
 /// A parsed cast member (CASt chunk data).
 #[derive(Debug, Clone)]
 pub struct CastMember {
@@ -460,6 +556,124 @@ fn read_u32(data: &[u8], pos: &mut usize, endian: Endian) -> u32 {
     v
 }
 
+/// A cast library entry from the MCsL (Cast List) chunk — the movie's full
+/// cast library table. Cast 0 is the internal cast; every other entry names a
+/// LINKED cast file (external .cst/.cct) or an empty internal slot (a
+/// pre-allocated placeholder like the corpus's `empty N` casts). `path` is
+/// the Director-time file path (e.g. `D:\\LINGO\\Builds\\...\\empty.cst`),
+/// empty for internal casts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CastListEntry {
+    pub name: String,
+    pub path: String,
+    pub min_member: u32,
+    pub max_member: u32,
+    pub member_count: u32,
+    /// Cast library id as stored in the entry's member-range item (the value
+    /// LibreShockwave prints as casts.txt's `id` column).
+    pub id: i32,
+}
+
+/// Parse the MCsL (Cast List) chunk: the movie's cast library table.
+///
+/// Layout (Director 7+, big-endian, per LibreShockwave CastListChunk::read):
+///
+/// ```text
+/// i32 dataOffset      — offset from chunk start to the offset table
+/// u16 (unknown)
+/// u16 itemCount       — number of cast library entries
+/// u16 itemsPerEntry   — items per entry (4: name, path, preload, member-range)
+/// u16 (unknown)
+///   at dataOffset:
+/// u16 offsetTableLen  — number of u32 offsets
+/// i32 offsets[offsetTableLen]
+/// i32 itemsLen        — byte length of the items blob
+///   items blob: one Pascal string or small struct per item
+/// ```
+///
+/// Each entry reads items at `base = i * itemsPerEntry`: item+1 = cast name,
+/// item+2 = linked-cast file path (empty for internal casts), item+3 =
+/// preload settings (ignored), item+4 = member-range struct (u16 minMember,
+/// u16 maxMember, i32 id).
+pub fn parse_cast_list(data: &[u8]) -> Vec<CastListEntry> {
+    if data.len() < 12 {
+        return Vec::new();
+    }
+    let rd = |pos: usize| -> usize { u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize };
+    let data_offset = rd(0);
+    let _ = rd(4); // unknown u16 (part of the 12-byte header: unk, itemCount, itemsPerEntry, unk)
+    let item_count = u16::from_be_bytes([data[6], data[7]]) as usize;
+    let items_per_entry = u16::from_be_bytes([data[8], data[9]]) as usize;
+    let _ = u16::from_be_bytes([data[10], data[11]]);
+
+    if data_offset >= data.len() || item_count > 1000 || items_per_entry == 0 {
+        return Vec::new();
+    }
+    let table = &data[data_offset..];
+    if table.len() < 2 {
+        return Vec::new();
+    }
+    let offset_table_len = u16::from_be_bytes([table[0], table[1]]) as usize;
+    if offset_table_len == 0 || offset_table_len > 10000 || table.len() < 2 + offset_table_len * 4 + 4 {
+        return Vec::new();
+    }
+    let mut offsets = Vec::with_capacity(offset_table_len);
+    for i in 0..offset_table_len {
+        offsets.push(rd(data_offset + 2 + i * 4) as i32);
+    }
+    let items_len_pos = data_offset + 2 + offset_table_len * 4;
+    let items_len = rd(items_len_pos) as i32;
+    let list_offset = items_len_pos + 4;
+    let mut items: Vec<Vec<u8>> = Vec::with_capacity(offsets.len());
+    for (index, &offset) in offsets.iter().enumerate() {
+        let next = if index + 1 < offsets.len() { offsets[index + 1] } else { items_len };
+        let item_len = next - offset;
+        let start = list_offset as i64 + offset as i64;
+        if offset >= 0 && item_len > 0 && item_len < 10000 && start >= 0 && (start as usize) <= data.len() {
+            let s = start as usize;
+            let e = s + item_len as usize;
+            if e <= data.len() {
+                items.push(data[s..e].to_vec());
+                continue;
+            }
+        }
+        items.push(Vec::new());
+    }
+    let pascal = |item: &[u8]| -> String {
+        if item.is_empty() {
+            return String::new();
+        }
+        let len = item[0] as usize;
+        if len == 0 || len > item.len() - 1 {
+            return String::new();
+        }
+        // MacRoman-ish; printable ASCII covers the corpus cast names/paths.
+        item[1..=len].iter().map(|&b| if b >= 32 && b < 127 { b as char } else { '?' }).collect()
+    };
+    let mut entries = Vec::with_capacity(item_count);
+    for cast_index in 0..item_count {
+        let base = cast_index * items_per_entry;
+        let name = pascal(items.get(base + 1).map(Vec::as_slice).unwrap_or(&[]));
+        let path = pascal(items.get(base + 2).map(Vec::as_slice).unwrap_or(&[]));
+        let mut entry = CastListEntry { name, path, min_member: 0, max_member: 0, member_count: 0, id: (cast_index + 1) as i32 };
+        if let Some(member_data) = items.get(base + 4) {
+            if member_data.len() >= 8 {
+                let min_member = u16::from_be_bytes([member_data[0], member_data[1]]) as u32;
+                let max_member = u16::from_be_bytes([member_data[2], member_data[3]]) as u32;
+                let id = i32::from_be_bytes([member_data[4], member_data[5], member_data[6], member_data[7]]);
+                entry.min_member = min_member;
+                entry.max_member = max_member;
+                entry.id = id;
+                if max_member >= min_member {
+                    entry.member_count = max_member - min_member + 1;
+                }
+            }
+        }
+        entries.push(entry);
+    }
+    entries
+}
+
 fn read_s16(data: &[u8], pos: usize, endian: Endian) -> i16 {
     match endian {
         Endian::Big => i16::from_be_bytes([data[pos], data[pos + 1]]),
@@ -476,5 +690,114 @@ mod tests {
         // Two entries: resource 0x274 (628) and 0x2cd (717), big-endian.
         let data = [0x00, 0x00, 0x02, 0x74, 0x00, 0x00, 0x02, 0xcd];
         assert_eq!(parse_cast_member_list(&data), vec![628, 717]);
+    }
+
+    /// Build an MCsL blob the way Director lays it out (see parse_cast_list
+    /// docs) and assert parse_cast_list round-trips it. Layout mirrors the
+    /// real habbo.dcr: item 0 is a global placeholder, then each cast library
+    /// entry spans 4 items — name, path, preload, member-range — so the
+    /// parser's `base + 1..=base + 4` indexing lands on the right ones.
+    fn build_mcsl(entries: &[(u16, u16, i32, &str, &str)]) -> Vec<u8> {
+        let items_per_entry = 4usize;
+        let mut items: Vec<Vec<u8>> = vec![vec![0]]; // leading global item
+        for (min, max, id, name, path) in entries {
+            let mut name_item = vec![name.len() as u8];
+            name_item.extend_from_slice(name.as_bytes());
+            let mut path_item = vec![path.len() as u8];
+            path_item.extend_from_slice(path.as_bytes());
+            let mut range = Vec::new();
+            range.extend_from_slice(&min.to_be_bytes());
+            range.extend_from_slice(&max.to_be_bytes());
+            range.extend_from_slice(&id.to_be_bytes());
+            items.push(name_item);
+            items.push(path_item);
+            items.push(vec![0, 0]); // preload settings
+            items.push(range);
+        }
+        // Offset table + items blob, packed back to back.
+        let mut blob = Vec::new();
+        let mut offsets: Vec<u32> = Vec::new();
+        for item in &items {
+            offsets.push(blob.len() as u32);
+            blob.extend_from_slice(item);
+        }
+        let mut data = Vec::new();
+        // Header: dataOffset=12, unk=0, itemCount, itemsPerEntry, unk=0.
+        data.extend_from_slice(&12u32.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        data.extend_from_slice(&(items_per_entry as u16).to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&(offsets.len() as u16).to_be_bytes());
+        for o in &offsets {
+            data.extend_from_slice(&o.to_be_bytes());
+        }
+        data.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        data.extend_from_slice(&blob);
+        data
+    }
+
+    #[test]
+    fn parse_shape_info_and_text() {
+        // hh_entry_au member 247 (skyleft): rect 720x359, color 78 (0x4e).
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x01u16.to_be_bytes()); // shapeType rect
+        data.extend_from_slice(&0u16.to_be_bytes()); // regY
+        data.extend_from_slice(&0u16.to_be_bytes()); // regX
+        data.extend_from_slice(&359u16.to_be_bytes()); // height
+        data.extend_from_slice(&720u16.to_be_bytes()); // width
+        data.extend_from_slice(&[0, 0]); // skip 2
+        data.extend_from_slice(&[78, 0, 1, 1, 5]); // color, backColor, fillType, lineThickness, lineDirection
+        let s = ShapeInfo::parse(&data).expect("parse");
+        assert_eq!(s.shape_type, ShapeType::Rect);
+        assert_eq!(s.width, 720);
+        assert_eq!(s.height, 359);
+        assert_eq!(s.color, 78);
+        assert_eq!(s.back_color, 0);
+        assert!(s.is_filled());
+        let text = s.to_text();
+        assert!(text.contains("shapeType: rect\n"));
+        assert!(text.contains("width: 720\n"));
+        assert!(text.contains("color: 0x4e\n"));
+        assert!(text.contains("backColor: 0\n"));
+        assert!(text.contains("filled: yes\n"));
+        assert!(text.contains("outlineInvisible: no\n"));
+        // A thin unfilled line: outlineInvisible yes, color 0 prints as 0.
+        let mut line = Vec::new();
+        line.extend_from_slice(&0x08u16.to_be_bytes()); // line
+        line.extend_from_slice(&[0; 10]);
+        line.extend_from_slice(&[0, 0, 0, 1, 5]);
+        let l = ShapeInfo::parse(&line).expect("parse line");
+        assert_eq!(l.shape_type, ShapeType::Line);
+        assert!(!l.is_filled());
+        assert!(l.is_outline_invisible());
+        assert!(l.to_text().contains("color: 0\n"));
+        assert!(l.to_text().contains("filled: no\n"));
+        assert!(l.to_text().contains("outlineInvisible: yes\n"));
+    }
+
+    #[test]
+    fn parse_cast_list_round_trip() {
+        let blob = build_mcsl(&[
+            (1, 4, 66560, "Internal", ""),
+            (1, 82, 1024, "fuse_client", r"D:\LINGO\Builds\release14.1_bx\fuse_client.cst"),
+            (1, 0, 132096, "bin", ""),
+            (1, 0, 1024, "empty 1", r"D:\LINGO\Builds\release14.1_bx\empty.cst"),
+        ]);
+        let entries = parse_cast_list(&blob);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].name, "Internal");
+        assert_eq!(entries[0].path, "");
+        assert_eq!(entries[0].min_member, 1);
+        assert_eq!(entries[0].max_member, 4);
+        assert_eq!(entries[0].member_count, 4);
+        assert_eq!(entries[0].id, 66560);
+        assert_eq!(entries[1].name, "fuse_client");
+        assert_eq!(entries[1].path, r"D:\LINGO\Builds\release14.1_bx\fuse_client.cst");
+        assert_eq!(entries[1].member_count, 82);
+        // Empty cast: member_count 0 (min 1, max 0 → no range).
+        assert_eq!(entries[2].member_count, 0);
+        assert_eq!(entries[3].name, "empty 1");
+        assert_eq!(entries[3].member_count, 0);
     }
 }

@@ -23,20 +23,23 @@ use std::path::Path;
 use std::fs;
 
 use director_rifx::Chunk;
-use director_core::{cast, key, clut, bitd, decomp, font, lscr, stxt, sound};
+use director_core::{cast, key, clut, bitd, decomp, font, lingo, lscr, stxt, sound};
+use director_core::cast::CastListEntry;
 
 /// Export a Director file's contents to a project folder.
 pub fn export_project(
     root: &Chunk,
     output_dir: &Path,
     name: &str,
+    lasm: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base = output_dir.join(sanitize_filename(name));
     fs::create_dir_all(&base)?;
 
     write_movie_txt(root, &base)?;
     write_casts_txt(root, &base, name)?;
-    export_cast_members(root, &base)?;
+    write_linked_casts_txt(root, &base)?;
+    export_cast_members(root, &base, lasm)?;
     export_movie_fonts(root, &base)?;
 
     Ok(())
@@ -299,17 +302,40 @@ fn sanitize_filename(name: &str) -> String {
 /// Movie-level config, tab-separated, mirroring LibreShockwave's movie.txt.
 ///
 /// Field offsets follow LibreShockwave ConfigChunk::read (D7 DRCF, big-endian):
-///   @0  fileVersion (u16, discarded)   @2  fileVersion2
+///   @0  fileVersion (u16)          @2  fileVersion2 (u16; movie_version)
 ///   @4  stageTop   @6  stageLeft   @8  stageBottom   @10 stageRight (i16)
 ///   @12 minMember  @14 maxMember  @16 skip(2)
-///   @18 d7StageColorG  @19 d7StageColorB
+///   @18 d7StageColorG  @19 d7StageColorB   (D7+; D6: skip 2)
 ///   @20 commentFont  @22 commentSize  @24 commentStyle
-///   @26 isRgb  @27 stageColorR  @28 bgColor
+///   @26 isRgb (u8)  @27 stageColorR (u8)
+///   @28 bgColor (i16, palette index)
 ///   @30 skip2  @32 skip4  @36 directorVersion (u16)
 ///   @38 skip2  @40 skip4  @44 skip4  @48 skip4  @52 skip2
-///   @54 tempo  @56 platform
+///   @54 tempo (i16)  @56 platform (i16)
+///   (trailing, if >= 22 bytes left) skip18  @+18 defaultPaletteCastLib (i16)
+///                                            @+20 defaultPaletteMember (i16)
 /// stage_width/height = stageRight-stageLeft / stageBottom-stageTop (like LS,
-/// which yields 0 for the cast-only Habbo CCTs).
+/// which yields 0 for the cast-only Habbo CCTs). Colors: bgColor is a PALETTE
+/// index, stageColor packs isRgb<<8|R, stageColorRgb is the resolved RGB
+/// (isRgb ? R<<16|G<<8|B : systemMac[stageColorR]). Writes the same 16-field
+/// layout LibreShockwave's exportMovieConfig emits (verified against
+/// exported-old/habbo/movie.txt).
+/// Director version from the DRCF config chunk (u16 @ offset 36), used to gate
+/// the 32-bit bitmap channel layout (separated planes for Director >= 1000,
+/// interleaved ARGB before — LibreShockwave decode32Bit).
+fn director_version_of(root: &Chunk) -> u16 {
+    root.child(b"DRCF")
+        .and_then(|d| {
+            let d = d.data();
+            if d.len() >= 38 {
+                Some(u16::from_be_bytes([d[36], d[37]]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
 fn write_movie_txt(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let Some(drcf) = root.child(b"DRCF") else { return Ok(()) };
     let d = drcf.data();
@@ -328,6 +354,14 @@ fn write_movie_txt(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::error::
             None
         }
     };
+    let beu8 = |o: usize| -> Option<u8> { d.get(o).copied() };
+
+    // 0xRRGGBB hex like LibreShockwave's colorHex (uppercase, 6 digits).
+    let color_hex = |v: i32| format!("0x{:06X}", v & 0xFFFFFF);
+
+    // Director version gates the D7 color layout (LibreShockwave: >= 0x208).
+    let director_version = be16(36).unwrap_or(0);
+    let d7 = director_version >= 0x208;
 
     let mut out = String::new();
     if let (Some(l), Some(r)) = (bei16(6), bei16(10)) {
@@ -344,17 +378,125 @@ fn write_movie_txt(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::error::
         out.push_str(&format!("stage_right\t{r}\n"));
         out.push_str(&format!("stage_bottom\t{b}\n"));
     }
+    // background_color: the DRCF palette-index bg color (LibreShockwave emits
+    // the raw index value, e.g. 0x000020 for index 32).
+    if let Some(bg) = bei16(28) {
+        out.push_str(&format!("background_color\t{}\n", color_hex(bg as i32)));
+    }
+    // stage_color (isRgb<<8|R) and stage_color_rgb (resolved RGB).
+    if d7 {
+        if let (Some(g), Some(b)) = (beu8(18), beu8(19)) {
+            if let (Some(is_rgb), Some(r)) = (beu8(26), beu8(27)) {
+                let stage_color = ((is_rgb as i32) << 8) | r as i32;
+                let stage_color_rgb = if is_rgb != 0 {
+                    ((r as i32) << 16) | ((g as i32) << 8) | b as i32
+                } else {
+                    // Non-RGB: stageColorR indexes the system Mac palette
+                    // (LibreShockwave ConfigChunk::read resolves it through
+                    // systemMacPalette().getColor). fuse_client's stage color
+                    // is index 255 = white — keeping the raw index made the
+                    // loading-bar/stage backdrop black.
+                    let mac = clut::system_mac_palette();
+                    let (cr, cg, cb) = mac.colors.get(r as usize % mac.colors.len()).copied().unwrap_or((0, 0, 0));
+                    ((cr as i32) << 16) | ((cg as i32) << 8) | cb as i32
+                };
+                out.push_str(&format!("stage_color\t{}\n", color_hex(stage_color)));
+                out.push_str(&format!("stage_color_rgb\t{}\n", color_hex(stage_color_rgb)));
+            }
+        }
+    } else if let Some(sc) = bei16(26) {
+        out.push_str(&format!("stage_color\t{}\n", color_hex(sc as i32)));
+    }
+    if let Some(t) = be16(54) {
+        out.push_str(&format!("tempo\t{t}\n"));
+    }
     if let Some(min) = be16(12) { out.push_str(&format!("min_member\t{min}\n")); }
     if let Some(max) = be16(14) { out.push_str(&format!("max_member\t{max}\n")); }
-    if let Some(v) = be16(36) { out.push_str(&format!("director_version\t{v}\n")); }
-    if let Some(t) = be16(54) { out.push_str(&format!("tempo\t{t}\n")); }
+    // default_palette castLib:member (trailing DRCF fields, D7).
+    if let Some(platform) = bei16(56) {
+        let trailing = 58usize;
+        if d.len() >= trailing + 22 {
+            let cast_lib = i16::from_be_bytes([d[trailing + 18], d[trailing + 19]]);
+            let member = i16::from_be_bytes([d[trailing + 20], d[trailing + 21]]);
+            out.push_str(&format!("default_palette\t{cast_lib}:{member}\n"));
+        }
+        out.push_str(&format!("director_version\t{director_version}\n"));
+        if let Some(mv) = be16(2) {
+            out.push_str(&format!("movie_version\t{mv}\n"));
+        }
+        out.push_str(&format!("platform\t{platform}\n"));
+    }
 
     fs::write(base.join("movie.txt"), out)?;
     Ok(())
 }
 
-/// Cast library list, mirroring LibreShockwave's casts.txt.
+/// External casts linked from this movie — one absolute path per line, derived
+/// from the MCsL cast list (every entry with a non-empty path; deduped, in
+/// list order). Mirrors LibreShockwave's linked_casts.txt (exportLinkedCasts +
+/// DirectorFile::getExternalCastPaths). The bundler/runtime read it to know
+/// which cast files the movie links (fuse_client, empty.cst, ...) so the
+/// CastLoad Manager can fetch and register them — WITHOUT it the linked casts
+/// never load and the boot scripts (e.g. fuse_client's global declarations)
+/// never run.
+fn write_linked_casts_txt(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for chunk in root.children_by(b"MCsL") {
+        for entry in cast::parse_cast_list(chunk.data()) {
+            if entry.path.is_empty() || seen.contains(&entry.path) {
+                continue;
+            }
+            seen.insert(entry.path.clone());
+            paths.push(entry.path);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut out = String::from("# External casts linked from this movie, one per line.\n");
+    for p in &paths {
+        out.push_str(p);
+        out.push('\n');
+    }
+    fs::write(base.join("linked_casts.txt"), out)?;
+    Ok(())
+}
+
+/// Cast library list, mirroring LibreShockwave's casts.txt. The MCsL (Cast
+/// List) chunk holds the movie's FULL cast library table — cast 0 (internal)
+/// plus every LINKED cast (external .cst/.cct files) and the pre-allocated
+/// empty slots, each with its Director-time file path. Previously this only
+/// walked the local CAS* member array, so linked casts (fuse_client, the
+/// `empty N` placeholders, …) never appeared — exactly the corruption the
+/// CastLoad Manager guards against (`the number of castLibs` must match the
+/// movie's real list, not just the casts present in this one file).
 fn write_casts_txt(root: &Chunk, base: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut out = String::from(
+        "# Cast libraries in this movie. path is empty for internal casts; \
+         member_count 0 means an empty cast.\nid\tname\tpath\tmin_member\tmax_member\tmember_count\n",
+    );
+
+    let mcsl_chunks = root.children_by(b"MCsL");
+    let entries: Vec<CastListEntry> = mcsl_chunks
+        .iter()
+        .flat_map(|c| cast::parse_cast_list(c.data()))
+        .collect();
+
+    if !entries.is_empty() {
+        // The movie's own cast list — names, paths, member ranges (LibreShockwave
+        // exportCastList format, verified byte-identical against habbo.dcr).
+        for e in &entries {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                e.id, e.name, e.path, e.min_member, e.max_member, e.member_count
+            ));
+        }
+        fs::write(base.join("casts.txt"), out)?;
+        return Ok(());
+    }
+
+    // Fallback (no MCsL — older files): the local CAS* member arrays.
     let cas_chunks = root.children_by(b"CAS*");
     if cas_chunks.is_empty() {
         return Ok(());
@@ -371,10 +513,6 @@ fn write_casts_txt(root: &Chunk, base: &Path, name: &str) -> Result<(), Box<dyn 
         })
         .unwrap_or(1);
 
-    let mut out = String::from(
-        "# Cast libraries in this movie. path is empty for internal casts; \
-         member_count 0 means an empty cast.\nid\tname\tpath\tmin_member\tmax_member\tmember_count\n",
-    );
     for (i, cas) in cas_chunks.iter().enumerate() {
         let members = cast::parse_cast_member_list(cas.data());
         let member_count = members.iter().filter(|&&r| r != 0).count();
@@ -472,7 +610,9 @@ fn sanitize_member_name(name: &str) -> String {
     out
 }
 
-fn export_cast_members(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn export_cast_members(root: &Chunk, base: &Path, lasm: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let director_version = director_version_of(root);
+
     // Collect CLUT chunks keyed by their resource id (for KEY*-linked palettes),
     // plus the file-order list used by the unlinked-palette scorer.
     let mut clut_by_id: std::collections::HashMap<u32, Vec<(u8, u8, u8)>> = std::collections::HashMap::new();
@@ -577,9 +717,9 @@ fn export_cast_members(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::err
             cast::CastMemberType::Bitmap | cast::CastMemberType::Picture => export_bitmap(
                 &cm, root, member_bitd.get(&member_id).copied(), member_id,
                 &dir, &base_name, &member_clut, &clut_by_id, &member_num_map,
-                palette, &unlinked_defaults, &palettes,
+                palette, &unlinked_defaults, &palettes, director_version,
             ),
-            cast::CastMemberType::Script => export_script(root, &cm, &dir, &base_name),
+            cast::CastMemberType::Script => export_script(root, &cm, &dir, &base_name, lasm),
             cast::CastMemberType::Text | cast::CastMemberType::Button => {
                 let stxt = member_stxt
                     .get(&member_id)
@@ -602,7 +742,7 @@ fn export_cast_members(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::err
                 r
             }
             cast::CastMemberType::Font => export_font(root, &cm, &dir, &base_name, &member_xmed, member_id),
-            cast::CastMemberType::Shape => export_raw(&cm, &dir, &base_name),
+            cast::CastMemberType::Shape => export_shape(&cm, &dir, &base_name),
             _ => Ok(()),
         };
 
@@ -622,6 +762,7 @@ fn export_cast_members(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::err
 /// a CLUT linked via KEY*, or the fallback CLUT — plus how the render looks
 /// (distinct colors / % black) so palette bugs are visible at a glance.
 pub fn report_palettes(root: &Chunk) {
+    let director_version = director_version_of(root);
     // CLUT resources by resource id.
     let mut clut_by_id: std::collections::HashMap<u32, Vec<(u8, u8, u8)>> = std::collections::HashMap::new();
     let mut palettes: Vec<Vec<(u8, u8, u8)>> = Vec::new();
@@ -761,6 +902,7 @@ pub fn report_palettes(root: &Chunk) {
                 info.bits_per_pixel,
                 pitch,
                 colors,
+                director_version,
             ) {
                 Ok(rgba) => {
                     let mut black = 0u32;
@@ -815,6 +957,7 @@ pub fn report_palettes(root: &Chunk) {
                         info.bits_per_pixel,
                         pitch,
                         colors,
+                        director_version,
                     ) {
                         let mut black = 0u32;
                         let mut set = std::collections::HashSet::new();
@@ -841,6 +984,7 @@ pub fn report_palettes(root: &Chunk) {
                     info.bits_per_pixel,
                     pitch,
                     &mac.colors,
+                    director_version,
                 ) {
                     let mut black = 0u32;
                     let mut set = std::collections::HashSet::new();
@@ -956,6 +1100,7 @@ fn export_bitmap(
     fallback_palette: &[(u8, u8, u8)],
     unlinked_defaults: &std::collections::HashMap<i16, Option<(usize, i64, i64)>>,
     palettes: &[Vec<(u8, u8, u8)>],
+    director_version: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_d5 = cm.cast_info_size > 0 && cm.cast_data_size > 0 && cm.raw_data.len() >= 12;
 
@@ -1063,14 +1208,49 @@ fn export_bitmap(
             .map(|p| p.colors.as_slice())
             .unwrap_or(fallback_palette)
     };
-    let rgba = bitd::decode_to_rgba(&pixel_data, width, height, bpp, pitch, member_palette)
-        .map_err(|e| format!("decode: {e}"))?;
+    let rgba = bitd::decode_to_rgba(
+        &pixel_data,
+        width,
+        height,
+        bpp,
+        pitch,
+        member_palette,
+        director_version,
+    )
+    .map_err(|e| format!("decode: {e}"))?;
 
-    let Some(img) = image::RgbaImage::from_raw(width as u32, height as u32, rgba) else {
-        return Err("Failed to create RgbaImage from raw pixels".into());
-    };
     fs::create_dir_all(dir)?;
-    img.save(dir.join(format!("{base_name}.png")))?;
+    let png_path = dir.join(format!("{base_name}.png"));
+    // 8-bit palette bitmaps are written as INDEXED PNGs (color type 3, PLTE =
+    // the member's palette) so the pixel INDICES survive the export. The
+    // runtime's `member.paletteRef = member(<pattern palette>)` remap (room
+    // wall/floor patterns: Private Room Engine setWallPaper/setFloorPattern)
+    // recolors each pixel by its index through the target palette — an RGBA
+    // export loses that mapping when several indices share one color (the
+    // fuzzy floor tile's dither interior is all-white in its own palette but
+    // a white/gray checkerboard through floor_fuzzy1). Indexed is also
+    // smaller (1 byte/px vs 4). All other bit depths keep the RGBA export.
+    if bpp == 8 && !member_palette.is_empty() {
+        let indices = bitd::decompress_rle(&pixel_data, width, height, bpp, pitch)
+            .map_err(|e| format!("index decode: {e}"))?;
+        let pal: Vec<u8> = member_palette
+            .iter()
+            .take(256)
+            .flat_map(|(r, g, b)| [*r, *g, *b])
+            .collect();
+        let file = std::fs::File::create(&png_path)?;
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+        enc.set_color(png::ColorType::Indexed);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_palette(pal);
+        let mut writer = enc.write_header()?;
+        writer.write_image_data(&indices)?;
+    } else {
+        let Some(img) = image::RgbaImage::from_raw(width as u32, height as u32, rgba) else {
+            return Err("Failed to create RgbaImage from raw pixels".into());
+        };
+        img.save(&png_path)?;
+    }
 
     // .pal sidecar (JASC-PAL) — skipped for 32bpp+ (no palette; LibreShockwave
     // exportBitmapPalette rule).
@@ -1093,6 +1273,7 @@ fn export_script(
     cm: &cast::CastMember,
     dir: &Path,
     base_name: &str,
+    lasm: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // A script member's info block stores a `scriptId` — a 1-based index into
     // the LctX ScriptContext entries. That entry's `sectionId` is the LSCR
@@ -1173,6 +1354,16 @@ fn export_script(
     );
     fs::create_dir_all(dir)?;
     fs::write(dir.join(format!("{base_name}.ls")), format!("{header}{text}"))?;
+
+    // --lasm: also write the raw bytecode disassembly (opcode-level) so the
+    // decompiled .ls can be verified against the real LSCR instructions.
+    if lasm {
+        let dasm = lingo::disassemble_script(&script, names.as_ref());
+        fs::write(
+            dir.join(format!("{base_name}.lasm")),
+            lingo::format_script(&dasm),
+        )?;
+    }
     Ok(())
 }
 
@@ -1284,24 +1475,53 @@ fn export_sound(
 }
 
 fn write_sound_chunk(chunk: &Chunk, dir: &Path, base_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if chunk.is(b"ediM") {
-        // Embedded media: sniff the container magic and write as-is.
-        let data = chunk.data();
-        let ext = if data.starts_with(b"FORM") {
-            "aiff"
-        } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WAVE" {
-            "wav"
-        } else if data.starts_with(b"ID3")
-            || (data.len() > 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0)
-        {
-            "mp3"
-        } else {
-            "bin"
-        };
+    let data = chunk.data();
+    // Container sniff FIRST — it applies to every sound tag, not just ediM.
+    // The Habbo corpus ships its sound members inside a Sulake custom
+    // container (format fields + a "© 2007 Sulake Corp" block + an offset
+    // table) followed by the REAL MP3 frames, and that container can arrive
+    // under 'SND ' just as often as 'ediM'. The old SND path misread the
+    // container as Mac 'snd ' data (its first u16s parsed as "extended format"
+    // with a bogus 98385 Hz sample rate) and dumped the WHOLE container as
+    // 8-bit PCM — which plays back as static. Detect the wrapper by scanning
+    // for the first valid MPEG frame sync and strip it (plus any trailing
+    // 0xFF padding) so the runtime gets a standard MP3, byte-identical to the
+    // libreshockwave export.
+    if data.starts_with(b"FORM") {
         fs::create_dir_all(dir)?;
-        fs::write(dir.join(format!("{base_name}.{ext}")), data)?;
+        fs::write(dir.join(format!("{base_name}.aiff")), data)?;
         return Ok(());
     }
+    if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WAVE" {
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{base_name}.wav")), data)?;
+        return Ok(());
+    }
+    if data.starts_with(b"ID3") || (data.len() > 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0) {
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{base_name}.mp3")), data)?;
+        return Ok(());
+    }
+    if let Some(sync) = find_mp3_sync(data) {
+        // Sulake-wrapped MP3: the bytes from the first frame sync are the real
+        // MP3. Trim the trailing 0xFF padding run like the reference export.
+        let mut end = data.len();
+        while end > sync + 4 && data[end - 1] == 0xFF {
+            end -= 1;
+        }
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{base_name}.mp3")), &data[sync..end])?;
+        return Ok(());
+    }
+    if chunk.is(b"ediM") {
+        // Embedded media that isn't a recognizable container: keep the raw
+        // bytes under .bin so no member is lost (the bundler ranks it lowest).
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{base_name}.bin")), data)?;
+        return Ok(());
+    }
+    // Real Mac 'snd ' resource (the sniffs above only fall through for actual
+    // PCM sound data) — decode the header and write a proper WAV.
     match sound::read_snd(chunk) {
         Ok(sd) => {
             let sample_rate = if sd.info.sample_rate > 0 { sd.info.sample_rate } else { 22050 };
@@ -1314,6 +1534,27 @@ fn write_sound_chunk(chunk: &Chunk, dir: &Path, base_name: &str) -> Result<(), B
         }
         Err(_) => Err("SND parse failed".into()),
     }
+}
+
+/// First valid MPEG audio frame sync (0xFF Ex with a well-formed header), or
+/// None. Validates the version/layer/bitrate/sample-rate fields so 0xFF
+/// padding runs inside container headers are skipped (0xFF FF FF parses as a
+/// free-format bitrate index and is rejected).
+fn find_mp3_sync(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len().saturating_sub(4) {
+        if data[i] != 0xFF || (data[i + 1] & 0xE0) != 0xE0 {
+            continue;
+        }
+        let version = (data[i + 1] >> 3) & 0x3;
+        let layer_bits = (data[i + 1] >> 1) & 0x3;
+        let bitrate_idx = (data[i + 2] >> 4) & 0xF;
+        let sr_idx = (data[i + 2] >> 2) & 0x3;
+        if version == 1 || layer_bits == 0 || sr_idx == 3 || bitrate_idx == 0 || bitrate_idx == 15 {
+            continue;
+        }
+        return Some(i);
+    }
+    None
 }
 
 /// Build a WAV file from raw PCM data.
@@ -1485,14 +1726,123 @@ fn export_movie_fonts(root: &Chunk, base: &Path) -> Result<(), Box<dyn std::erro
 }
 
 // ---------------------------------------------------------------------------
-// Raw export (shapes) → .bin
+// Shape export (shapes) → .txt
 // ---------------------------------------------------------------------------
 
-/// Raw member data (shapes; fonts fall back here only when no linked PFR1
-/// XMED payload exists). The .bin is the member's full CASt data (D5 header +
-/// info block).
+/// Shape members export as `shapes/NNNN_shape_<name>.txt` (key: value lines)
+/// — the format the runtime's parseShapeText consumes to draw the entry/room
+/// scenes' solid-fill rects/ovals. The data block sits after the CASt header
+/// (u32 type, u32 infoLen, u32 dataLen) and the info section.
+fn export_shape(cm: &cast::CastMember, dir: &Path, base_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let is_d5 = cm.cast_info_size > 0 && cm.cast_data_size > 0 && cm.raw_data.len() >= 12;
+    let block: &[u8] = if is_d5 {
+        let start = 12 + cm.cast_info_size as usize;
+        let len = cm.cast_data_size as usize;
+        if start + len <= cm.raw_data.len() {
+            &cm.raw_data[start..start + len]
+        } else if start <= cm.raw_data.len() {
+            &cm.raw_data[start..]
+        } else {
+            &[]
+        }
+    } else {
+        &cm.raw_data
+    };
+    let Some(info) = cast::ShapeInfo::parse(block) else {
+        // Not parseable as a shape — fall back to raw .bin so nothing is lost.
+        fs::create_dir_all(dir)?;
+        fs::write(dir.join(format!("{base_name}.bin")), &cm.raw_data)?;
+        return Ok(());
+    };
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join(format!("{base_name}.txt")), info.to_text())?;
+    Ok(())
+}
+
+/// Raw member data (fonts fall back here only when no linked PFR1 XMED payload
+/// exists). The .bin is the member's full CASt data (D5 header + info block).
 fn export_raw(cm: &cast::CastMember, dir: &Path, base_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(dir)?;
     fs::write(dir.join(format!("{base_name}.bin")), &cm.raw_data)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use director_rifx::chunk::read_chunk;
+
+    /// The real Sulake container header from hh_purse's naw_snd_cash member:
+    /// 82 bytes of format fields before the first MPEG frame sync (0xFF FB 50).
+    /// read_snd misreads these first u16s as an "extended" Mac 'snd ' header,
+    /// reporting a bogus 98385 Hz / 8-bit format — dumping the whole container
+    /// as PCM is what produced the static sound in the old export.
+    const SULAKE_HEADER: [u8; 82] = [
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x80, 0x51, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xac, 0x44,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x3c,
+        0x00, 0x00, 0xac, 0x11, 0x40, 0x0e, 0xac, 0x44, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x71,
+    ];
+
+    /// A real MPEG1 Layer III frame header (44.1 kHz, 128 kbps) plus payload —
+    /// the frame-sync validator in find_mp3_sync must accept it.
+    const MP3_SYNC: [u8; 4] = [0xFF, 0xFB, 0x50, 0x00];
+
+    fn write_chunk(tag: &[u8; 4], data: &[u8]) -> Chunk {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(tag);
+        raw.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        raw.extend_from_slice(data);
+        let mut pos = 0u64;
+        let (chunk, _) = read_chunk(&raw, &mut pos).unwrap();
+        chunk
+    }
+
+    #[test]
+    fn sulake_wrapped_mp3_under_snd_tag_exports_clean_mp3() {
+        // Container: format-fields header + real MP3 frames + trailing 0xFF
+        // padding run (the Sulake wrapper layout found in the Habbo corpus).
+        let mut container = Vec::new();
+        container.extend_from_slice(&SULAKE_HEADER);
+        container.extend_from_slice(&MP3_SYNC);
+        container.extend_from_slice(b"\x00\x12\x34\x56\x78\x9a\xbc\xde\xf0");
+        container.extend_from_slice(&[0xFF; 8]); // trailing padding
+
+        let dir = std::env::temp_dir().join(format!(
+            "sparkd-sound-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        write_sound_chunk(&write_chunk(b"SND ", &container), &dir, "0021_sound_naw_snd_cash")
+            .expect("SND-tagged Sulake container must export");
+
+        // The header + padding must be stripped: the file is a standard MP3.
+        let out = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+        assert_eq!(out, vec!["0021_sound_naw_snd_cash.mp3".to_string()]);
+        let bytes = fs::read(dir.join("0021_sound_naw_snd_cash.mp3")).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&MP3_SYNC);
+        expected.extend_from_slice(b"\x00\x12\x34\x56\x78\x9a\xbc\xde\xf0");
+        assert_eq!(bytes, expected, "must be the MP3 frames with no header/padding");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_wav_container_passes_through_untouched() {
+        // A genuine RIFF/WAVE chunk must be written as-is (not mangled).
+        let wav = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00";
+        let dir = std::env::temp_dir().join(format!(
+            "sparkd-sound-test-wav-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        write_sound_chunk(&write_chunk(b"ediM", wav), &dir, "0012_sound_tone")
+            .expect("plain WAV must export");
+        let bytes = fs::read(dir.join("0012_sound_tone.wav")).unwrap();
+        assert_eq!(bytes, wav);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
