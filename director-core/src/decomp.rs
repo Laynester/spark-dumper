@@ -1624,10 +1624,20 @@ impl<'a> Decoder<'a> {
                         translation = Some(Trans::Stmt(Stmt::Exit));
                     } else if args.len() == 1 {
                         translation = Some(Trans::Stmt(Stmt::Return(Box::new(args[0].clone()))));
-                    } else if noret {
-                        translation = Some(Trans::Stmt(Stmt::Call { name: call_name, args }));
                     } else {
-                        translation = Some(Trans::Expr(Expr::Call { name: call_name, args }));
+                        // `return RETURN, error(me, ...)` — the R31 compiler
+                        // emits the return-with-error-call idiom with the CR
+                        // literal as a leading sentinel arg (Sulake wrote
+                        // `return RETURN, error(...)`; the constant pool holds
+                        // a lone "\r" literal used only by these statements).
+                        // The value is a discard — the SAME handlers pair it
+                        // with plain `return error(...)` on their other error
+                        // paths, and LibreShockwave's decompiler materializes
+                        // the 2+ arg form as a plain call whose value is
+                        // dropped. Render it as a return of the LAST value
+                        // (the error() result) so the output stays a clean
+                        // return statement that matches the sibling lines.
+                        translation = Some(Trans::Stmt(Stmt::Return(Box::new(args[args.len() - 1].clone()))));
                     }
                 } else if noret {
                     translation = Some(Trans::Stmt(Stmt::Call { name: call_name, args }));

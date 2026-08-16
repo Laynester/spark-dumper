@@ -436,13 +436,33 @@ fn read_memory_map(
             continue;
         }
 
-        let chunk_data = &data[offset_file..offset_file + size];
-
         // XFIR stores the FourCC tag as a LE u32 of the MKTAG value; plain RIFX
         // stores it canonical. Reconstruct the canonical spelling either way.
         let fourcc = match container {
             FileContainer::Xfire => tag_le.to_be_bytes(),
             FileContainer::Rifx => tag_le.to_le_bytes(),
+        };
+
+        // Memory-map resources are stored WITH their own 8-byte chunk header
+        // (byte-reversed FourCC + LE length) at the mmap offset. The mmap
+        // `size` field is the DATA length: the resource's own header mirrors
+        // it (verified: header length == mmap size for every resource, and
+        // resources are packed at [offset, offset + 8 + size)).
+        // build_rifx_container writes the canonical header from this entry's
+        // tag, so skip the resource's own header and keep the full `size`
+        // bytes of data — LibreShockwave DirectorFile::loadRIFX slices
+        // [offset + 8, offset + 8 + length). Slicing [offset, offset+size)
+        // then stripping 8 here would drop the tail 8 bytes of every
+        // resource: for CASt members that truncates the Pascal name at the
+        // end of the info block, yielding `member_N` fallback names, and for
+        // LctX/Lscr it loses trailing entries/bytes. Degenerate stubs (data
+        // not starting with the reversed tag) are passed through untouched.
+        let raw = &data[offset_file..(offset_file + size + 8).min(data.len())];
+        let rev: [u8; 4] = [fourcc[3], fourcc[2], fourcc[1], fourcc[0]];
+        let chunk_data = if raw.len() >= 8 && raw[..4] == rev {
+            &raw[8..]
+        } else {
+            raw
         };
         chunks.push((i as u32, fourcc, chunk_data.to_vec()));
 
@@ -457,13 +477,20 @@ fn read_memory_map(
     let chunk_source_ids = chunks.iter().map(|c| c.0).collect();
     let rifx_data = build_rifx_container(&chunks);
 
+    // Content endianness: the mmap/imap tables and the KEY* key table are
+    // little-endian (read with explicit LE readers), but the actual chunk
+    // contents (CASt member data, BITD, LctX, STXT, Lscr, ...) are big-endian
+    // Director format — verified against Habbo v31 MV93 files (fuse_client,
+    // hh_ig_game_snowwar: CASt member types read as 1..14 only when big-endian).
+    // Afterburner files use Endian::Big for the same content; the container
+    // format (XFIR vs RIFX) must not change how chunk contents are read.
     Ok(AfterburnerFile {
         version,
         version_string,
         resources: Vec::new(), // memory map doesn't use ABMP resources
         rifx_data,
         chunk_source_ids,
-        endian: Endian::Little,
+        endian: Endian::Big,
         container,
         codec: [0; 4],
         fver_imap_v: 0,
