@@ -656,15 +656,25 @@ fn export_cast_members(root: &Chunk, base: &Path, lasm: bool) -> Result<(), Box<
         }
     }
 
-    // The %04d prefix is the 1-based CASt chunk position in the decompressed
-    // file's chunk-tree order — exactly how LibreShockwave numbers members
-    // (DirectorFile::categorizeChunk pushes CASt chunks in file order, and
-    // CastExporter counts them with a running ordinal). Verified: every
-    // LibreShockwave pool text ordinal == our CASt chunk index + 1
-    // (thread.pelle=0074 -> chunk[73], pool_a=0082 -> chunk[81], ...).
-    // Not the CAS*-derived member number: that shifts every file by its
-    // leading empty/other-type slots.
+    // The %04d prefix is the REAL Lingo member number (the CAS*-derived
+    // number, minMember + CAS* index), NOT the 1-based CASt chunk position.
+    // Director addresses members by these numbers — "the next cast member"
+    // semantics (ink 9 Mask: the sprite's member + 1, DirPlayer
+    // rendering.rs / LibreShockwave SpriteBaker resolveMaskMember) only
+    // survive the export when the prefix keeps the original numbering. The
+    // chunk-position ordinal can drift far from the member number (empty
+    // slots + resource-id ordering), which is exactly how the pool water
+    // (vesi2 -> vesimask2) lost its mask adjacency in earlier exports.
+    // Verified against the original ccts: pool vesi1=84 -> vesimask1=85,
+    // vesi2=89 -> vesimask2=90, terrace dew_vesi1=33 -> dew_vesimask1=34.
     let member_num_map = build_member_number_map(root);
+    // Inverse: CASt resource id -> real member number (the CAS* map is
+    // member number -> resource id). Members with no CAS* entry (unnapped
+    // chunks) fall back to the chunk-position ordinal below.
+    let member_num_of: std::collections::HashMap<u32, u32> = member_num_map
+        .iter()
+        .map(|(num, res)| (*res, *num))
+        .collect();
 
     // Palette members whose clutId fails the KEY* chain get the LibreShockwave
     // unlinked-mac-like resolution: aggregate index usage across every member
@@ -677,16 +687,14 @@ fn export_cast_members(root: &Chunk, base: &Path, lasm: bool) -> Result<(), Box<
     let stxt_chunks = root.children_by(b"STXT").to_vec();
     let mut text_member_index = 0usize;
 
-    // Palette members: index among palette members in chunk order (k).
-    // LibreShockwave exportPalette resolves resolveExact(k), which first tries
-    // the CAS* member at member number k+1's KEY* CLUT child, falling back to
-    // this palette member's own CLUT child. Replicated for byte-identical .pal.
-    let mut palette_member_index = 0usize;
-
     for (i, cast_chunk) in root.children_by(b"CASt").iter().enumerate() {
         let member_id = cast_chunk.source_id.unwrap_or(i as u32);
         let Ok(cm) = cast::read_cast_member(cast_chunk) else { continue };
         let ordinal = i as u32 + 1;
+        // The export prefix is the real Lingo member number when the CAS*
+        // map knows this member; the chunk-position ordinal only as a
+        // fallback for chunks the map doesn't list.
+        let member_number = member_num_of.get(&member_id).copied().unwrap_or(ordinal);
 
         // Member name comes from the CASt info block (D4+), not Lnam (Lnam is
         // the Lingo script-name table).
@@ -707,7 +715,7 @@ fn export_cast_members(root: &Chunk, base: &Path, lasm: bool) -> Result<(), Box<
             safe_name
         };
 
-        let base_name = format!("{:04}_{}_{}", ordinal, member_type_name(cm.member_type), safe_name);
+        let base_name = format!("{:04}_{}_{}", member_number, member_type_name(cm.member_type), safe_name);
         // Dir is created lazily by each exporter right before its first write,
         // so movies with members that export nothing (no scriptId, no STXT,
         // unknown types) don't get stray empty folders.
@@ -731,14 +739,24 @@ fn export_cast_members(root: &Chunk, base: &Path, lasm: bool) -> Result<(), Box<
             }
             cast::CastMemberType::Sound => export_sound(root, &cm, &dir, &base_name, &member_snd, member_id),
             cast::CastMemberType::Palette => {
+                // The palette member's OWN CLUT child (KEY* parent = this
+                // member's CASt resource). This was previously resolved as
+                // member number `palette_member_index + 1` (the chunk ordinal
+                // among palette members), which is only correct when palette
+                // chunk order happens to equal member numbering. In
+                // hh_room_floorlobbies the palette chunks run in member order
+                // [7, 6, 4, 3, 2, 5, 1, 105, 104], so every palette file was
+                // filled from a DIFFERENT member's CLUT (floorlobby_a got
+                // floor_lamp's all-black table; the true olive/teal basement
+                // table ended up under "topwindows"). Resolve by the member's
+                // REAL number so each .pal carries its own table.
                 let colors = member_num_map
-                    .get(&(palette_member_index as u32 + 1))
+                    .get(&member_number)
                     .and_then(|res| member_clut.get(res))
                     .and_then(|clut| clut_by_id.get(clut))
                     .map(|c| clut::mac_like_tail_fill(c))
                     .or_else(|| member_clut.get(&member_id).and_then(|c| clut_by_id.get(c)).map(|c| clut::mac_like_tail_fill(c)));
                 let r = export_palette(&dir, &base_name, colors.as_ref());
-                palette_member_index += 1;
                 r
             }
             cast::CastMemberType::Font => export_font(root, &cm, &dir, &base_name, &member_xmed, member_id),

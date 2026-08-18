@@ -26,7 +26,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -44,6 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked -p director-dump --bin sparkd --target ${{ matrix.target }}
@@ -60,10 +61,17 @@ jobs:
         run: |
           BIN="target/$TARGET/release/sparkd"
           chmod +x "$BIN"
-          # target triple -> short os/arch for asset naming
-          OS=$(echo "$TARGET" | sed -n 's/^[a-z0-9]*-unknown-\(linux\|darwin\)-.*/\1/p')
-          if [ "$OS" = "" ]; then OS="unknown"; fi
-          ARCH=$(case "$TARGET" in *arm64*|aarch64*) echo arm64;; x86_64*) echo x86_64;; esac)
+          # target triple -> short os/arch for asset naming (bash 3.2 safe)
+          case "$TARGET" in
+            *apple-darwin*) OS=darwin ;;
+            *linux*)        OS=linux ;;
+            *)              OS=unknown ;;
+          esac
+          case "$TARGET" in
+            aarch64-*)  ARCH=arm64 ;;
+            x86_64-*)   ARCH=x86_64 ;;
+            *)          ARCH=unknown ;;
+          esac
           PKG="sparkd-${{ steps.version.outputs.VERSION }}-$OS-$ARCH"
           mkdir -p "$PKG"
           cp "$BIN" "$PKG/sparkd"
